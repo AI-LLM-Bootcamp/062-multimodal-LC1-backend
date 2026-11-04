@@ -74,7 +74,7 @@ def get_pdf_by_id(id: int, db: Session = Depends(get_db)):
     return pdf
 
 @router.put("/{id}", response_model=schemas.PDFResponse)
-def update_pdf(id: int, pdf: schemas.PDFRequest, db: Session = Depends(get_db)):
+def update_pdf(id: int, pdf: schemas.PDFUpdate, db: Session = Depends(get_db)):
     old_pdf = crud.read_pdf(db, id)
     old_file = old_pdf.file if old_pdf else None
     updated_pdf = crud.update_pdf(db, id, pdf)
