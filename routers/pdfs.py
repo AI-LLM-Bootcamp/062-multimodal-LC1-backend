@@ -6,25 +6,43 @@ import crud
 from database import SessionLocal
 from uuid import uuid4
 
-# LangChain 1.0 imports for Multimodal RAG
+# LangChain 1 imports for Multimodal RAG
+#
+# Update note:
+# - gpt-4o-mini is replaced by gpt-6-luna, which reads text and images.
+#   It is a reasoning model: we create it with reasoning_effort="none" and
+#   without max_tokens=1024 (a small limit can leave the answer empty).
+# - Each PDF gets its own retriever, built once and kept in memory, with its
+#   own Chroma collection. Before, every question added a new set of summaries
+#   to one shared collection, and answers got worse with each question.
+# - PyMuPDF is imported with its current name, pymupdf (fitz is the legacy name).
 import tempfile
 import os
 import uuid
 import base64
 import requests
-import fitz  # pymupdf: renders PDF pages as images
-from langchain_openai import ChatOpenAI, OpenAIEmbeddings
+import pymupdf  # renders PDF pages as images
+from langchain.chat_models import init_chat_model
+from langchain_openai import OpenAIEmbeddings
 from langchain.tools import tool
 from langchain.agents import create_agent
 from langchain.messages import HumanMessage
 from langchain_classic.retrievers.multi_vector import MultiVectorRetriever
-from langchain_classic.schema.document import Document
-from langchain_classic.storage import InMemoryStore
+from langchain_core.documents import Document
+from langchain_core.stores import InMemoryStore
 from langchain_chroma import Chroma
 from unstructured_client import UnstructuredClient
 from config import get_settings
 
 router = APIRouter(prefix="/pdfs")
+
+# One model for everything: text summaries, table summaries, page images and the agent.
+# Change it here if OpenAI retires it.
+MODEL = "gpt-6-luna"
+
+# Retrievers already built, one per PDF: {pdf_id: retriever}
+# The first question about a PDF builds its retriever; the next questions reuse it.
+RETRIEVERS = {}
 
 def get_db():
     db = SessionLocal()
@@ -33,7 +51,7 @@ def get_db():
     finally:
         db.close()
 
-# ============= EXISTING ENDPOINTS (unchanged) =============
+# ============= EXISTING ENDPOINTS =============
 
 @router.post("", response_model=schemas.PDFResponse, status_code=status.HTTP_201_CREATED)
 def create_pdf(pdf: schemas.PDFRequest, db: Session = Depends(get_db)):
@@ -57,15 +75,21 @@ def get_pdf_by_id(id: int, db: Session = Depends(get_db)):
 
 @router.put("/{id}", response_model=schemas.PDFResponse)
 def update_pdf(id: int, pdf: schemas.PDFRequest, db: Session = Depends(get_db)):
+    old_pdf = crud.read_pdf(db, id)
+    old_file = old_pdf.file if old_pdf else None
     updated_pdf = crud.update_pdf(db, id, pdf)
     if updated_pdf is None:
         raise HTTPException(status_code=404, detail="PDF not found")
+    # If the file changed, its saved retriever is no longer valid
+    if updated_pdf.file != old_file:
+        forget_retriever(id)
     return updated_pdf
 
 @router.delete("/{id}", status_code=status.HTTP_200_OK)
 def delete_pdf(id: int, db: Session = Depends(get_db)):
     if not crud.delete_pdf(db, id):
         raise HTTPException(status_code=404, detail="PDF not found")
+    forget_retriever(id)  # remove its summaries from memory too
     return {"message": "PDF successfully deleted"}
 
 # ============= MULTIMODAL RAG FUNCTIONALITY =============
@@ -89,9 +113,9 @@ def extract_pdf_elements(pdf_path: str):
     Extract text, tables, and images from a PDF file.
 
     - Text and tables: extracted via the Unstructured API (good at structured content)
-    - Page images: rendered via pymupdf and sent to GPT-4o for description
+    - Page images: rendered via pymupdf and sent to the vision model for description
 
-    pymupdf renders each page as an image, which guarantees GPT-4o sees everything
+    pymupdf renders each page as an image, which guarantees the model sees everything
     on the page — including vector-based charts that the Unstructured API may miss.
 
     Args:
@@ -154,7 +178,7 @@ def extract_pdf_elements(pdf_path: str):
     # Render each PDF page as an image using pymupdf
     # This captures everything visible on the page: charts, diagrams, photos, etc.
     image_base64_list = []
-    doc = fitz.open(pdf_path)
+    doc = pymupdf.open(pdf_path)
     for page_num, page in enumerate(doc, 1):
         pix = page.get_pixmap(dpi=200)
         img_bytes = pix.tobytes("png")
@@ -173,13 +197,13 @@ def extract_pdf_elements(pdf_path: str):
 
 # ========== SUMMARIZATION FUNCTIONS ==========
 
-def summarize_image(image_base64: str, model: ChatOpenAI) -> str:
+def summarize_image(image_base64: str, model) -> str:
     """
-    Use GPT-4o to describe an image.
+    Use a vision model to describe a page image.
 
     Args:
-        image_base64: Base64-encoded image string (from Unstructured API)
-        model: ChatOpenAI model instance with vision capabilities (gpt-4o or gpt-4o-mini)
+        image_base64: Base64-encoded PNG image of a PDF page (from pymupdf)
+        model: a chat model that can read images (here gpt-6-luna)
 
     Returns:
         str: Description of the image
@@ -195,19 +219,19 @@ def summarize_image(image_base64: str, model: ChatOpenAI) -> str:
                 - The overall meaning or purpose of the image"""
             },
             {
-                "type": "image_url",
-                "image_url": {
-                    "url": f"data:image/jpeg;base64,{image_base64}"
-                }
+                # LangChain's standard image block: works with every provider
+                "type": "image",
+                "base64": image_base64,
+                "mime_type": "image/png",  # pymupdf renders the pages as PNG
             }
         ]
     )
 
     response = model.invoke([message])
-    return response.content
+    return response.text
 
 
-def summarize_text(text: str, model: ChatOpenAI) -> str:
+def summarize_text(text: str, model) -> str:
     """Summarize a text element."""
     prompt = f"""Summarize the following text concisely while preserving key information:
 
@@ -215,10 +239,10 @@ def summarize_text(text: str, model: ChatOpenAI) -> str:
 
 Summary:"""
     response = model.invoke([HumanMessage(content=prompt)])
-    return response.content
+    return response.text
 
 
-def summarize_table(table: str, model: ChatOpenAI) -> str:
+def summarize_table(table: str, model) -> str:
     """Summarize a table element."""
     prompt = f"""Summarize the following table, highlighting key data points and relationships:
 
@@ -226,20 +250,22 @@ def summarize_table(table: str, model: ChatOpenAI) -> str:
 
 Summary:"""
     response = model.invoke([HumanMessage(content=prompt)])
-    return response.content
+    return response.text
 
 
 def create_all_summaries(text_elements, table_elements, image_base64_list):
     """
     Create summaries for all content types.
 
-    Uses gpt-4o-mini for everything — text, tables, and images.
-    It's fast, cheap, multimodal, and recommended over the legacy gpt-3.5-turbo.
+    Uses one model for everything — text, tables, and page images.
+    gpt-6-luna is fast, low cost and reads both text and images.
 
     Returns:
         tuple: (text_summaries, table_summaries, image_summaries)
     """
-    model = ChatOpenAI(model="gpt-4o-mini", max_tokens=1024)
+    # reasoning_effort="none": fast, direct summaries.
+    # No max_tokens: with a reasoning model, a small limit can leave the answer empty.
+    model = init_chat_model(MODEL, reasoning_effort="none")
 
     print("Summarizing text elements...")
     text_summaries = []
@@ -263,7 +289,7 @@ def create_all_summaries(text_elements, table_elements, image_base64_list):
             print(f"  Error on table {i}: {e}")
             table_summaries.append(f"Error: {str(e)[:100]}")
 
-    print("Summarizing page images with GPT-4o-mini...")
+    print(f"Summarizing page images with {MODEL}...")
     image_summaries = []
     for i, image_b64 in enumerate(image_base64_list, 1):
         try:
@@ -282,7 +308,8 @@ def create_all_summaries(text_elements, table_elements, image_base64_list):
 def create_multimodal_retriever(
     text_summaries, text_elements,
     table_summaries, table_elements,
-    image_summaries
+    image_summaries,
+    collection_name="multimodal_summaries"
 ):
     """
     Create a Multi-Vector Retriever for multimodal content.
@@ -292,15 +319,21 @@ def create_multimodal_retriever(
     - Doc Store: Contains original content (for accurate answers)
     - UUIDs link summaries to their original content
 
+    Args:
+        collection_name: the Chroma collection for this PDF (one per PDF)
+
     Returns:
         MultiVectorRetriever: Configured retriever
     """
     embeddings = OpenAIEmbeddings(model="text-embedding-3-small")
 
     vectorstore = Chroma(
-        collection_name="multimodal_summaries",
+        collection_name=collection_name,
         embedding_function=embeddings
     )
+    # Start from an empty collection: Chroma keeps collections in memory
+    # while the server runs, and old summaries would point to nothing
+    vectorstore.reset_collection()
 
     docstore = InMemoryStore()
     id_key = "doc_id"
@@ -340,13 +373,64 @@ def create_multimodal_retriever(
     return retriever
 
 
+def get_retriever(pdf):
+    """
+    Return the retriever for this PDF, building it only the first time.
+
+    The slow and costly steps (download, extraction, summaries) run once per PDF.
+    The next questions about the same PDF reuse the retriever, so they are faster
+    and cheaper. In a real app you would save the summaries in a database, so a
+    server restart does not lose them.
+    """
+    if pdf.id in RETRIEVERS:
+        print(f"Reusing the retriever of PDF {pdf.id}")
+        return RETRIEVERS[pdf.id]
+
+    temp_path = None
+    try:
+        # Step 1: Download PDF from S3
+        temp_path = download_pdf_from_url(pdf.file)
+
+        # Step 2: Extract text and tables (Unstructured API) and page images (pymupdf)
+        text_elements, table_elements, image_base64_list = extract_pdf_elements(
+            temp_path
+        )
+
+        # Step 3: Create summaries for all content types
+        text_summaries, table_summaries, image_summaries = create_all_summaries(
+            text_elements, table_elements, image_base64_list
+        )
+
+        # Step 4: Build the Multi-Vector Retriever, with its own collection
+        retriever = create_multimodal_retriever(
+            text_summaries, text_elements,
+            table_summaries, table_elements,
+            image_summaries,
+            collection_name=f"pdf-{pdf.id}"
+        )
+        RETRIEVERS[pdf.id] = retriever
+        return retriever
+
+    finally:
+        # Clean up temporary PDF file
+        if temp_path and os.path.exists(temp_path):
+            os.unlink(temp_path)
+
+
+def forget_retriever(pdf_id: int):
+    """Remove the saved retriever of a PDF (for example, when the PDF is deleted)."""
+    retriever = RETRIEVERS.pop(pdf_id, None)
+    if retriever is not None:
+        retriever.vectorstore.delete_collection()
+
+
 # ========== MULTIMODAL RAG AGENT ==========
 
 def create_multimodal_rag_agent(retriever):
     """
-    Create a LangChain 1.0 RAG agent with multimodal search capabilities.
+    Create a LangChain 1 RAG agent with multimodal search capabilities.
 
-    Uses the modern create_agent function introduced in LangChain 1.0.
+    Uses the create_agent function of LangChain 1.
     The agent decides when to use tools and can reason about queries.
 
     Args:
@@ -377,8 +461,12 @@ def create_multimodal_rag_agent(retriever):
 
         return "\n\n".join(formatted_results)
 
+    # This agent uses a tool: with gpt-6-luna, LangChain's default OpenAI endpoint
+    # accepts tools only with reasoning_effort="none"
+    model = init_chat_model(MODEL, reasoning_effort="none")
+
     agent = create_agent(
-        model="gpt-4o-mini",
+        model=model,
         tools=[search_documents],
         system_prompt="""You are a helpful assistant that answers questions about documents.
 
@@ -411,47 +499,23 @@ async def ask_pdf(id: int, request: schemas.QuestionRequest, db: Session = Depen
     if pdf is None:
         raise HTTPException(status_code=404, detail="PDF not found")
 
-    temp_path = None
-    try:
-        # Step 1: Download PDF from S3
-        temp_path = download_pdf_from_url(pdf.file)
+    # Steps 1-4: get the retriever of this PDF (built only the first time)
+    retriever = get_retriever(pdf)
 
-        # Step 2: Extract text, tables, AND images via Unstructured API
-        text_elements, table_elements, image_base64_list = extract_pdf_elements(
-            temp_path
-        )
+    # Step 5: Create the multimodal RAG agent
+    agent = create_multimodal_rag_agent(retriever)
 
-        # Step 3: Create summaries for all content types
-        text_summaries, table_summaries, image_summaries = create_all_summaries(
-            text_elements, table_elements, image_base64_list
-        )
+    # Step 6: Ask the question
+    response = agent.invoke(
+        {"messages": [HumanMessage(content=request.question)]}
+    )
 
-        # Step 4: Build the Multi-Vector Retriever
-        retriever = create_multimodal_retriever(
-            text_summaries, text_elements,
-            table_summaries, table_elements,
-            image_summaries
-        )
+    # Extract the answer (only the text of the last message)
+    answer = response["messages"][-1].text
 
-        # Step 5: Create the multimodal RAG agent
-        agent = create_multimodal_rag_agent(retriever)
-
-        # Step 6: Ask the question
-        response = agent.invoke(
-            {"messages": [HumanMessage(content=request.question)]}
-        )
-
-        # Extract the answer
-        answer = response["messages"][-1].content
-
-        return {
-            "pdf_id": id,
-            "pdf_name": pdf.name,
-            "question": request.question,
-            "answer": answer
-        }
-
-    finally:
-        # Clean up temporary PDF file
-        if temp_path and os.path.exists(temp_path):
-            os.unlink(temp_path)
+    return {
+        "pdf_id": id,
+        "pdf_name": pdf.name,
+        "question": request.question,
+        "answer": answer
+    }
